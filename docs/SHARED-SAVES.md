@@ -26,6 +26,10 @@ So: choose the folder on the PC that has the saves first, let it sync, then choo
   library that card can be older than the library (another PC saved meanwhile). The launcher now records the SHA-256 of the
   card it wrote or harvested (`card.ps2.harvested`) and harvests only a card the game changed since then (a run whose
   harvest did not happen). This applies with or without a shared folder.
+- **Older save.** A card with no record (left by a launcher from before this feature) is harvested, but a harvest never
+  replaces the library's active save with an older one: the save's modified time, as the game wrote it in the card's
+  directory entry, must not be earlier than the library's (`Report::kept_newer`). Without this, the first Play on a PC
+  that last ran the old launcher put that PC's old save back over the newer one from another PC (seen 2026-11-25).
 - **Folder not there** (OneDrive not signed in, drive missing): the launcher shows this PC's library but refuses Play, so
   the progress does not split between two places.
 - **Another PC is playing**: `in-use.json` names the PC that started the game; it is removed after the harvest. Play on

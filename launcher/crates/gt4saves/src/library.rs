@@ -89,6 +89,10 @@ pub struct Report {
     pub skipped: Vec<String>,
     /// The active game save was replaced; the old copy went to `<saves>/.backup`.
     pub replaced_active: bool,
+    /// Game saves left alone by a harvest because the card's copy is older than the library's (its modified time, as the
+    /// game wrote it, is earlier): with a library shared by several PCs, a card left on one PC can be older than what
+    /// another PC saved since.
+    pub kept_newer: Vec<String>,
 }
 
 /// `Save 01`, `Save 02`, ...
@@ -506,6 +510,11 @@ impl Library {
                         report.unchanged.push(name);
                         continue;
                     }
+                    // Never put an older save back over a newer one (a stale card from another PC of a shared library).
+                    if card_time_order(item.entry.modified()) < card_time_order(before.entry.modified()) {
+                        report.kept_newer.push(name);
+                        continue;
+                    }
                     let backup = self.active_backup_dir();
                     let stamp = crate::timestamp();
                     let copy_dir = backup.join(format!("{name}-{stamp}"));
@@ -563,6 +572,12 @@ impl Library {
         }
         Ok(deleted)
     }
+}
+
+/// A card timestamp (unused, second, minute, hour, day, month, year u16 little endian) as a value that sorts by time:
+/// year, month, day, hour, minute, second.
+fn card_time_order(time: [u8; 8]) -> (u16, u8, u8, u8, u8, u8) {
+    (u16::from_le_bytes([time[6], time[7]]), time[5], time[4], time[3], time[2], time[1])
 }
 
 /// Card images kept in `<backups>` (about 8 MB each).

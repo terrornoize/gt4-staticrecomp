@@ -115,6 +115,32 @@ fn harvest_replaces_a_changed_save_and_never_deletes() {
     assert!(lib.replays_dir().join(REPLAY).is_dir(), "a replay missing from the card is kept, not deleted");
 }
 
+fn game_save_at(garage_seed: u8, modified: [u8; 8]) -> Node {
+    let entry = DirEntry::new(GT4_GAME_SAVE, MODE_DIR_DEFAULT, STAMP, modified).unwrap();
+    Node::dir(entry, vec![file("icon.sys", pattern(964, 1)), file("garage", pattern(1_280_064, garage_seed))])
+}
+
+// A shared library: a PC whose card still holds the save of its last run (older than what another PC saved since) must not
+// put that save back. The save's modified time, written by the game, tells which one is newer.
+#[test]
+fn harvest_never_puts_an_older_save_over_a_newer_one() {
+    const NOV_20: [u8; 8] = [0, 56, 4, 4, 20, 11, 0xEA, 0x07];
+    const NOV_25: [u8; 8] = [0, 46, 40, 7, 25, 11, 0xEA, 0x07];
+    let lib = Library::open(&scratch("harvest-older"), GT4).unwrap();
+    lib.harvest(&Card::build(&[game_save_at(30, NOV_25)]).unwrap().to_image()).unwrap();
+
+    let stale = Card::build(&[game_save_at(31, NOV_20)]).unwrap().to_image();
+    let report = lib.harvest(&stale).unwrap();
+    assert_eq!(report.kept_newer, vec![GT4_GAME_SAVE.to_string()]);
+    assert!(!report.replaced_active);
+    let kept = folder::import_item(&lib.active_dir().join(GT4_GAME_SAVE)).unwrap();
+    assert!(gt4saves::card::same_contents(std::slice::from_ref(&kept), std::slice::from_ref(&game_save_at(30, NOV_25))));
+
+    // A newer save from the card still replaces the library's.
+    const NOV_26: [u8; 8] = [0, 0, 10, 20, 26, 11, 0xEA, 0x07];
+    assert!(lib.harvest(&Card::build(&[game_save_at(32, NOV_26)]).unwrap().to_image()).unwrap().replaced_active);
+}
+
 // Owner, 2026-11-03: the backups had no limit (74 card images, about 600 MB, in two weeks). Only the newest of each kind
 // stay, and names of any other form are left alone.
 #[test]
