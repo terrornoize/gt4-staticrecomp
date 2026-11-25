@@ -18,6 +18,7 @@ use gt4l_core::launch;
 use gt4l_core::paths::{self, DataDirs};
 use gt4l_core::settings;
 use gt4l_core::shader_prepare::{GaveUp, PrepareOutcome};
+use gt4l_core::shared_library;
 use gt4l_core::{Settings, LAUNCHER_VERSION};
 use gt4l_disc::setup::{self as disc_setup, Installed};
 use gt4l_platform::game;
@@ -567,7 +568,12 @@ pub fn play(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
     // TASK-097: a direct start of the game reads these files; they follow the monitors connected now.
     lock(&shared).write_standalone_files(&settings);
     let card = dirs.runtime_card();
+    // The shared library folder (OneDrive, say): refuse when it cannot be used, warn once when another PC is playing.
+    let library_user = check_shared_library_for_play(&shared, game, language).inspect_err(|message| {
+        lock(&shared).home_message = message.clone();
+    })?;
     saves::prepare_card(lock(&shared).library_of(game), &card, language)?;
+    let computer = shared_library::computer_name();
     let (textures, textures_note) = lock(&shared).texture_location();
     if let Some(note) = &textures_note {
         state::log_warn(&dirs, note);
@@ -593,6 +599,10 @@ pub fn play(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
         }
     };
     let start_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    // Other PCs that share the library see that this one is playing (removed after the harvest below).
+    if let Err(error) = shared_library::mark_in_use(&library_user, &computer, start_unix.max(0) as u64) {
+        state::log_warn(&dirs, &format!("save library: in-use marker not written: {error}"));
+    }
     {
         let mut state = lock(&shared);
         state.game_child = Some(running.child.clone());
@@ -638,7 +648,13 @@ pub fn play(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
         // Issue #89: a lost graphics card is named in plain words, ahead of the restart and the generic crash text.
         let gpu_lost = matches!(outcome, Outcome::Crashed { .. }).then(|| exit::gpu_lost_line(&log_text)).flatten();
         match saves::harvest_card(lock(&shared).library_of(game), &card) {
-            Ok(report) => state::log(&dirs, &format!("card harvested: {report:?}")),
+            Ok(report) => {
+                state::log(&dirs, &format!("card harvested: {report:?}"));
+                // The marker goes only once the save is in the shared folder; a failed harvest keeps the warning up.
+                if let Err(error) = shared_library::clear_in_use(&library_user, &computer) {
+                    state::log_warn(&dirs, &format!("save library: in-use marker not removed: {error}"));
+                }
+            }
             Err(error) => state::log_error(&dirs, &format!("card not harvested: {error}")),
         }
         let log_path = running.log_path.clone();
@@ -1837,6 +1853,155 @@ pub fn reset_textures_folder(shared: State<'_, Shared>) -> Value {
         state.save_config();
     }
     textures_state_of(&state)
+}
+
+/// Before Play, with a shared library folder (`[install] library_path`): refuses when the folder cannot be used (Play
+/// would start on this PC's older saves, or on an empty card), and when another PC's in-use marker is there, refuses
+/// once with a warning; a second Play press for the same marker starts the game. Returns the user folders of `game`'s
+/// library (for the marker).
+fn check_shared_library_for_play(shared: &Shared, game: &'static Game, language: gt4l_core::language::Language) -> Result<gt4l_core::paths::UserDirs, String> {
+    let mut state = lock(shared);
+    if let Some(problem) = &state.library_problem {
+        return Err(problem.clone());
+    }
+    let user = state.user_for(game).clone();
+    let Some(folder) = user.shared_library() else {
+        return Ok(user);
+    };
+    if !folder.is_dir() {
+        return Err(messages::render(
+            "library.unavailable",
+            language,
+            &[("path", &folder.display().to_string()), ("reason", messages::text("library.invalid_not_found", language))],
+        ));
+    }
+    if let Some(marker) = shared_library::used_elsewhere(&user, &shared_library::computer_name()) {
+        let key = format!("{}@{}", marker.computer, marker.since_unix);
+        if state.in_use_confirmed.as_deref() != Some(key.as_str()) {
+            state::log_warn(&state.dirs, &format!("save library: in use on {} since {}; Play asks first", marker.computer, marker.since_unix));
+            state.in_use_confirmed = Some(key);
+            let since = UNIX_EPOCH + Duration::from_secs(marker.since_unix);
+            let since = gt4saves::iso8601_utc(since).replace('T', " ").trim_end_matches('Z').to_string() + " UTC";
+            return Err(messages::render("library.in_use_elsewhere", language, &[("computer", &marker.computer), ("since", &since)]));
+        }
+        state::log_warn(&state.dirs, &format!("save library: started although {} has the in-use marker (confirmed)", marker.computer));
+    }
+    state.in_use_confirmed = None;
+    Ok(user)
+}
+
+/// What the page shows of the save library folder: `path` the chosen shared folder (empty: this PC's folder), `local`
+/// this PC's library folder, `problem` why the shared folder cannot be used now (empty when it can).
+fn library_state_of(state: &AppState) -> Value {
+    let chosen = state.config.library_path.as_deref();
+    json!({
+        "path": chosen.map(|path| path.display().to_string()).unwrap_or_default(),
+        "local": state.user_dirs.root().display().to_string(),
+        "shared": chosen.is_some(),
+        "problem": state.library_problem.clone().unwrap_or_default(),
+        "message": state.saves_status.clone(),
+    })
+}
+
+/// `library_state()`: the save library folder choice, for the Settings page.
+#[tauri::command]
+pub fn library_state(shared: State<'_, Shared>) -> Value {
+    library_state_of(&lock(shared.inner()))
+}
+
+/// `choose_library_folder()`: the player picks a folder for the save library shared by several PCs (a OneDrive folder,
+/// say). For each game whose library there is still empty, this PC's saves and replays are copied in; a game that already
+/// has saves there (from another PC) uses those, and this PC's are left where they are. Nothing is moved or deleted.
+/// Refused while the game runs. Returns the new state, or `None` when the player cancels.
+#[tauri::command]
+pub async fn choose_library_folder(app: AppHandle, shared: State<'_, Shared>) -> Result<Option<Value>, String> {
+    let shared = shared.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (language, start) = {
+            let state = lock(&shared);
+            let language = state::language_of(&state);
+            if state.game_child.is_some() {
+                return Err(messages::text("library.game_running", language).to_string());
+            }
+            let start = state
+                .config
+                .library_path
+                .clone()
+                .filter(|path| path.is_dir())
+                .or_else(|| std::env::var_os("OneDrive").map(PathBuf::from).filter(|path| path.is_dir()))
+                .or_else(gt4l_platform::known_folder::documents)
+                .unwrap_or_else(|| state.user_dirs.root().to_path_buf());
+            (language, start)
+        };
+        let picked = app
+            .dialog()
+            .file()
+            .set_title(messages::text("library.pick_title", language))
+            .set_directory(&start)
+            .blocking_pick_folder();
+        let Some(picked) = picked else {
+            return Ok(None);
+        };
+        let folder = picked.into_path().map_err(|error| error.to_string())?;
+        let mut state = lock(&shared);
+        if state.game_child.is_some() {
+            return Err(messages::text("library.game_running", language).to_string());
+        }
+        let checked = shared_library::check_library_path(&folder, state.dirs.root(), state.user_dirs.root())
+            .map_err(|error| messages::text(error.message_id(), language).to_string())?;
+        let mut copied = Vec::new();
+        let mut kept = Vec::new();
+        for game in games::GAMES {
+            // This PC's library of the game as it is now (the shared one when a shared folder is in use already).
+            let current = state.user_for(game).clone();
+            let target = state.user_dirs.with_shared_library(&checked).for_game(game);
+            if current.saves() == target.saves() {
+                continue;
+            }
+            let adoption = shared_library::adopt(&current, &target)
+                .map_err(|error| messages::render("library.copy_failed", language, &[("path", &checked.display().to_string()), ("reason", &error.to_string())]))?;
+            state::log(&state.dirs, &format!("save library: {} {:?} into {}", game.id, adoption, checked.display()));
+            match adoption {
+                shared_library::Adoption::Copied => copied.push(game.display_name),
+                shared_library::Adoption::UsedShared => kept.push(game.display_name),
+                shared_library::Adoption::Empty => {}
+            }
+        }
+        state.config.library_path = Some(checked.clone());
+        state.save_config();
+        state.reopen_libraries()?;
+        let path = checked.display().to_string();
+        let mut parts = vec![messages::render("library.now_shared", language, &[("path", &path)])];
+        if !copied.is_empty() {
+            parts.push(messages::render("library.copied", language, &[("games", &copied.join(", "))]));
+        }
+        if !kept.is_empty() {
+            parts.push(messages::render("library.used_shared", language, &[("games", &kept.join(", "))]));
+        }
+        state.saves_status = parts.join(" ");
+        Ok(Some(library_state_of(&state)))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// `reset_library_folder()`: back to this PC's own library folder. The shared folder and everything in it are left as
+/// they are; this PC's library is as it was when the shared folder was chosen (the page says so). Refused while the game
+/// runs.
+#[tauri::command]
+pub fn reset_library_folder(shared: State<'_, Shared>) -> Result<Value, String> {
+    let mut state = lock(shared.inner());
+    let language = state::language_of(&state);
+    if state.game_child.is_some() {
+        return Err(messages::text("library.game_running", language).to_string());
+    }
+    if let Some(previous) = state.config.library_path.take() {
+        state::log(&state.dirs, &format!("save library: back to this PC's folder (shared folder {} left as it is)", previous.display()));
+        state.save_config();
+        state.reopen_libraries()?;
+        state.saves_status = messages::render("library.back_to_local", language, &[("path", &previous.display().to_string())]);
+    }
+    Ok(library_state_of(&state))
 }
 
 fn open_folder(folder: &Path) -> Result<(), String> {

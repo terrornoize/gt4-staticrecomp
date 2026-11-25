@@ -15,6 +15,7 @@ use gt4l_core::language::Language;
 use gt4l_core::messages;
 use gt4l_core::moves;
 use gt4l_core::paths::{DataDirs, UserDirs, UserRootSource};
+use gt4l_core::shared_library;
 use gt4saves::card::Node;
 use gt4saves::folder::FolderError;
 use gt4saves::library::{items_of_card_image, items_of_folder_card, items_of_psu, Library, LibraryError, LibraryPaths, Report, SLOT_PREFIX};
@@ -51,6 +52,9 @@ pub fn open(dirs: &DataDirs, user: &UserDirs, game: &Game, pre_1_0_root: Option<
     }
     match open_at(user, names, pre_1_0_root, &mut log) {
         Ok((library, notice)) => Ok(OpenedLibrary { library, user: user.clone(), log, notice }),
+        // A shared library folder that cannot be used is not replaced here: the caller goes back to this PC's library
+        // and says so (`state::open_libraries`), so the saves never split between a third place and the shared one.
+        Err(error) if user.shared_library().is_some() => Err(error),
         Err(error) if !matches!(user.source(), UserRootSource::Fallback(_)) => {
             let fallback = user.with_library_at(&dirs.fallback_user_root(), UserRootSource::Fallback(error.clone()));
             log.push(format!("save library: WARNING {} cannot be used ({error}); using {}", user.root().display(), fallback.root().display()));
@@ -64,6 +68,10 @@ pub fn open(dirs: &DataDirs, user: &UserDirs, game: &Game, pre_1_0_root: Option<
 
 fn open_at(user: &UserDirs, names: SaveNames, pre_1_0_root: Option<&Path>, log: &mut Vec<String>) -> Result<(Library, Option<String>), String> {
     guard::protect_user_library(user.root());
+    // A shared library folder is the player's data too: installs and updates never write there either.
+    if let Some(shared) = user.shared_library() {
+        guard::protect_user_library(shared);
+    }
     let mut notice = None;
     if let Some(old_root) = pre_1_0_root {
         let targets = Targets { saves: user.saves(), replays: user.replays(), names };
@@ -346,11 +354,17 @@ pub fn first_start_expected(library: &Library, runtime_card: &Path) -> bool {
 /// Writes the card for the next start: the active save and every replay, read back before it is
 /// written. A card the game left behind is harvested first, so nothing it wrote is lost; the old file
 /// is also kept under `backups` by `write_card_image`.
+///
+/// A card the launcher itself wrote or harvested last (its fingerprint is recorded, see `gt4l_core::shared_library`) holds
+/// nothing new and is not harvested: with a library shared by several PCs, this PC's card can be older than the library
+/// (another PC saved meanwhile), and harvesting it would put the old save back over the new one.
 pub fn prepare_card(library: &Library, runtime_card: &Path, language: Language) -> Result<(), String> {
     if runtime_card.is_file() {
         if let Ok(bytes) = fs::read(runtime_card) {
-            // An unreadable card is not an error here: its bytes are backed up when it is replaced.
-            let _ = library.harvest(&bytes);
+            if !shared_library::card_is_recorded(runtime_card, &bytes) {
+                // An unreadable card is not an error here: its bytes are backed up when it is replaced.
+                let _ = library.harvest(&bytes);
+            }
         }
     }
     let replay_names: Vec<String> = library.replays().map_err(|error| match error {
@@ -362,7 +376,10 @@ pub fn prepare_card(library: &Library, runtime_card: &Path, language: Language) 
     if let Some(parent) = runtime_card.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("runtime folder: {error}"))?;
     }
-    library.write_card_image(runtime_card, &image).map_err(|error| error.to_string())
+    library.write_card_image(runtime_card, &image).map_err(|error| error.to_string())?;
+    // A record that cannot be written only means the next start harvests this card once more (the behaviour before).
+    let _ = shared_library::record_card(runtime_card, &image);
+    Ok(())
 }
 
 /// What Play says when the card for the next start could not be built. A card that is full says so; a file of a save or a replay
@@ -403,13 +420,20 @@ fn library_relative_path(library: &Library, path: &Path) -> String {
     path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
-/// Copies the card the game wrote back into the library. A missing card means nothing was saved.
+/// Copies the card the game wrote back into the library. A missing card means nothing was saved; a card the launcher
+/// recorded as written or harvested (the game did not change it) holds nothing new either. After a harvest the card is
+/// recorded, so the next start does not harvest it again.
 pub fn harvest_card(library: &Library, runtime_card: &Path) -> Result<Report, String> {
     if !runtime_card.is_file() {
         return Ok(Report::default());
     }
     let bytes = fs::read(runtime_card).map_err(|error| format!("{}: {error}", runtime_card.display()))?;
-    library.harvest(&bytes).map_err(|error| error.to_string())
+    if shared_library::card_is_recorded(runtime_card, &bytes) {
+        return Ok(Report::default());
+    }
+    let report = library.harvest(&bytes).map_err(|error| error.to_string())?;
+    let _ = shared_library::record_card(runtime_card, &bytes);
+    Ok(report)
 }
 
 /// Short sentence about what an import did, for the Saves and Replays pages. An item of another game than the page shows
@@ -579,6 +603,62 @@ mod tests {
         assert!(user.saves().join("Active").join(GT4.save_folder).is_dir(), "the save is in Documents\\Gran Turismo 4\\Saves");
         assert!(user.replays().join(REPLAY).is_dir());
         assert!(!data.join("library").join("memcard").exists(), "nothing is written to the old AppData library");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    /// A PC with its own data folder whose library is in the shared folder `cloud`.
+    fn open_shared_pc(base: &Path, pc: &str, cloud: &Path) -> (PathBuf, Library) {
+        let data = base.join(pc);
+        let dirs = DataDirs::new(&data);
+        let user = UserDirs::new(data.join("user"), UserRootSource::Override).with_shared_library(cloud);
+        let opened = open(&dirs, &user, &GT4, None).unwrap();
+        assert_eq!(opened.user.saves(), cloud.join("games").join("gt4").join("Saves"));
+        let card = data.join("runtime").join("card.ps2");
+        fs::create_dir_all(card.parent().unwrap()).unwrap();
+        (card, opened.library)
+    }
+
+    #[test]
+    fn a_pc_whose_card_is_older_than_the_shared_library_does_not_put_its_old_save_back() {
+        let base = scratch("shared-two-pcs");
+        let cloud = base.join("cloud");
+        let (desktop_card, desktop) = open_shared_pc(&base, "desktop", &cloud);
+        let (handheld_card, handheld) = open_shared_pc(&base, "handheld", &cloud);
+
+        // The desktop plays and saves (save 1); the launcher harvests it into the shared folder.
+        prepare_card(&desktop, &desktop_card, Language::fallback()).unwrap();
+        fs::write(&desktop_card, card_with(&[game_save(1)])).unwrap();
+        assert!(harvest_card(&desktop, &desktop_card).unwrap().added.contains(&GT4.save_folder.to_string()));
+
+        // The handheld starts from save 1 and saves further (save 2).
+        prepare_card(&handheld, &handheld_card, Language::fallback()).unwrap();
+        assert!(handheld.harvest(&fs::read(&handheld_card).unwrap()).unwrap().unchanged.contains(&GT4.save_folder.to_string()), "the handheld card holds save 1");
+        fs::write(&handheld_card, card_with(&[game_save(2)])).unwrap();
+        harvest_card(&handheld, &handheld_card).unwrap();
+
+        // Back on the desktop: its card still holds save 1. It was harvested already, so Play builds the card from the
+        // shared library (save 2) instead of harvesting save 1 over it.
+        prepare_card(&desktop, &desktop_card, Language::fallback()).unwrap();
+        let report = desktop.harvest(&card_with(&[game_save(2)])).unwrap();
+        assert_eq!(report.unchanged, vec![GT4.save_folder.to_string()], "the shared active save is still save 2");
+        assert!(desktop.harvest(&fs::read(&desktop_card).unwrap()).unwrap().unchanged.contains(&GT4.save_folder.to_string()), "the desktop card now holds save 2");
+        // A second harvest of an unchanged card does nothing.
+        assert_eq!(harvest_card(&desktop, &desktop_card).unwrap(), Report::default());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_card_the_game_changed_without_a_harvest_is_still_harvested_at_the_next_play() {
+        let data = scratch("unharvested");
+        let (_, library) = open_scratch(&data);
+        let runtime_card = data.join("runtime").join("card.ps2");
+        fs::create_dir_all(runtime_card.parent().unwrap()).unwrap();
+        prepare_card(&library, &runtime_card, Language::fallback()).unwrap();
+        // The game saved, then the launcher was closed before its harvest.
+        fs::write(&runtime_card, card_with(&[game_save(3)])).unwrap();
+        prepare_card(&library, &runtime_card, Language::fallback()).unwrap();
+        assert_eq!(names(&saves(&library).unwrap()), vec![GT4.save_folder.to_string()], "the unharvested save was taken in");
+        assert_eq!(library.harvest(&card_with(&[game_save(3)])).unwrap().unchanged, vec![GT4.save_folder.to_string()]);
         let _ = fs::remove_dir_all(&data);
     }
 

@@ -314,6 +314,10 @@ pub struct UserDirs {
     /// Gran Turismo 4's library is still in the flat 1.2.x place (`saves`, `replays`, `card_backups` as given) until
     /// its move into `games\gt4` has happened. Any other game always has its own folder under `games`.
     flat_gt4: bool,
+    /// A save library folder the player chose (`[install] library_path`, for example a OneDrive folder shared by several
+    /// PCs). When set, `Saves` and `Replays` of every game are `<shared>\games\<id>\...`; settings, controls and the card
+    /// backups stay in `root` (they belong to this PC). See [`UserDirs::with_shared_library`].
+    shared_library: Option<PathBuf>,
 }
 
 impl UserDirs {
@@ -332,7 +336,24 @@ impl UserDirs {
             source,
             game: &GT4,
             flat_gt4: false,
+            shared_library: None,
         }
+    }
+
+    /// The same settings, controls and card backups, with `Saves` and `Replays` of every game in `shared`
+    /// (`<shared>\games\<id>\Saves`, `Replays`). The flat 1.2.x place is never used there: a shared folder is new.
+    pub fn with_shared_library(&self, shared: &Path) -> UserDirs {
+        UserDirs { shared_library: Some(shared.to_path_buf()), ..self.clone() }
+    }
+
+    /// The chosen shared library folder, when there is one.
+    pub fn shared_library(&self) -> Option<&Path> {
+        self.shared_library.as_deref()
+    }
+
+    /// `<shared>\games\<id>`: where this game's `Saves` and `Replays` are in the shared folder.
+    pub fn shared_game_library(&self) -> Option<PathBuf> {
+        self.shared_library.as_ref().map(|shared| shared.join(GAMES_FOLDER).join(self.game.id))
     }
 
     /// The same folders, naming the library of `game` (TASK-101): `games\<id>\Saves`, `Replays`, `backups` under the
@@ -380,6 +401,7 @@ impl UserDirs {
             source: UserRootSource::Legacy(reason),
             game: &GT4,
             flat_gt4: true,
+            shared_library: None,
         }
     }
 
@@ -394,6 +416,7 @@ impl UserDirs {
             source,
             // A library folder that already holds a flat Saves folder keeps it; a new one starts in the `games` layout.
             flat_gt4: root.join("Saves").is_dir(),
+            shared_library: None,
             ..self.clone()
         }
     }
@@ -409,12 +432,23 @@ impl UserDirs {
 
     /// `Saves`: the active save (`Active`), inactive slots (`Save NN`) and harvest copies (`.backup`).
     pub fn saves(&self) -> PathBuf {
+        if let Some(shared) = self.shared_game_library() {
+            return shared.join("Saves");
+        }
         if self.in_flat_place() { self.saves.clone() } else { self.game_library().join("Saves") }
     }
 
     /// `Replays`: one folder per replay.
     pub fn replays(&self) -> PathBuf {
+        if let Some(shared) = self.shared_game_library() {
+            return shared.join("Replays");
+        }
         if self.in_flat_place() { self.replays.clone() } else { self.game_library().join("Replays") }
+    }
+
+    /// The same folders without the shared library: `Saves` and `Replays` where they are on this PC.
+    pub fn local(&self) -> UserDirs {
+        UserDirs { shared_library: None, ..self.clone() }
     }
 
     pub fn config_dir(&self) -> &Path {

@@ -95,6 +95,7 @@ fn config_round_trip_keeps_values_and_paths() {
     config.settings.set_gs("hw_download_mode", "no-readbacks").unwrap();
     config.disc_path = Some(r#"D:\Games\Gran Turismo 4 "quoted" (USA).iso"#.into());
     config.textures_path = Some(r"E:\Emulators\PCSX2\textures".into());
+    config.library_path = Some(r"C:\Users\someone\OneDrive\SaveGames\gt4-staticrecomp".into());
     config.dev_game_dir = Some(r"C:\Antigravity\build\game".into());
     let text = config::render(&config);
     let (parsed, warnings) = config::parse(&text).unwrap();
@@ -117,6 +118,26 @@ fn textures_path_is_optional_and_keeps_windows_backslashes() {
     let (parsed, warnings) = config::parse(&text).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(parsed.textures_path.as_deref(), Some(std::path::Path::new(r"E:\Emulators\PCSX2\textures")));
+    assert_eq!(parsed, config);
+}
+
+#[test]
+fn library_path_is_optional_and_keeps_windows_backslashes() {
+    // No key, no shared library (no schema bump: an older launcher ignores the key).
+    let (absent, warnings) = config::parse("schema_version = 9\n[install]\ndisc_path = \"D:/gt4.iso\"\n").unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(absent.library_path, None);
+    assert!(!config::render(&absent).contains("library_path"));
+
+    let mut config = ConfigFile::default();
+    config.library_path = Some(r"C:\Users\someone\OneDrive\SaveGames\gt4-staticrecomp".into());
+    let text = config::render(&config);
+    assert!(
+        text.contains("[install]\nlibrary_path = \"C:\\\\Users\\\\someone\\\\OneDrive\\\\SaveGames\\\\gt4-staticrecomp\"\n"),
+        "{text}"
+    );
+    let (parsed, warnings) = config::parse(&text).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(parsed, config);
 }
 

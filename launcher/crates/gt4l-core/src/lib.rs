@@ -29,6 +29,7 @@ pub mod retroachievements;
 pub mod secret;
 pub mod settings;
 pub mod shader_prepare;
+pub mod shared_library;
 pub mod system_check;
 pub mod textures;
 pub mod update;

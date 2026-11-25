@@ -64,6 +64,9 @@ open_textures_folder
 textures_state
 choose_textures_folder
 reset_textures_folder
+library_state
+choose_library_folder
+reset_library_folder
 games_list
 select_game
 games_remove

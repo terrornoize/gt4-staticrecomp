@@ -50,6 +50,52 @@
     };
   }
 
+  // The save library folder (Saves page): this PC's, or a folder several PCs share (a OneDrive folder, say). Saves and
+  // replays of both games only; settings, controls and card backups stay on each PC. `changed(message)` runs after the
+  // folder changed, so the page reads its lists again.
+  function mountSharedFolder(content, changed) {
+    var problem = h("p", { class: "note library-problem", role: "status", data: { action: "library-problem" }, text: "", hidden: true });
+    var defaultButton;
+    function show(state) {
+      if (!state) { return; }
+      defaultButton.hidden = !state.shared;
+      problem.hidden = !state.problem;
+      problem.textContent = state.problem || "";
+    }
+    var chooseButton = h("button", {
+      class: "btn small",
+      type: "button",
+      data: { action: "choose-library-folder" },
+      on: { click: function () {
+        GT4.backend.call("choose_library_folder", {}).then(function (state) {
+          if (state) {
+            show(state);
+            changed(state.message);
+          }
+        }, function (err) { GT4.ui.toast(GT4.errorText(err), true); });
+      } }
+    }, GT4.t("settings.library_choose"));
+    defaultButton = h("button", {
+      class: "btn small",
+      type: "button",
+      data: { action: "reset-library-folder" },
+      hidden: true,
+      on: { click: function () {
+        GT4.backend.call("reset_library_folder", {}).then(function (state) {
+          show(state);
+          changed(state && state.message);
+        }, function (err) { GT4.ui.toast(GT4.errorText(err), true); });
+      } }
+    }, GT4.t("settings.library_default"));
+    content.appendChild(h("div", { class: "row lib-folder" }, [
+      h("div", { class: "k" }, [h("span", { text: GT4.t("settings.section_library") })]),
+      h("div", { class: "ctl" }, [chooseButton, defaultButton])
+    ]));
+    content.appendChild(h("p", { class: "note", text: GT4.t("settings.library_note") }));
+    content.appendChild(problem);
+    GT4.backend.call("library_state", {}).then(show, function () {});
+  }
+
   function mountLibrary(content, host, kindName) {
     var kind = kindInfo(kindName);
     var items = [];
@@ -430,6 +476,18 @@
         h("button", { class: "btn small", type: "button", on: { click: openFolder } }, GT4.t("common.open_folder"))
       ])
     ]));
+    if (kindName === "saves") {
+      mountSharedFolder(content, function (message) {
+        // The saves and replays now come from another folder: read both lists again.
+        GT4.cache.library.saves = null;
+        GT4.cache.library.replays = null;
+        GT4.backend.call(kind.list, {}).then(function (result) {
+          apply(result, message);
+        }, function (err) {
+          GT4.ui.toast(GT4.errorText(err), true);
+        });
+      });
+    }
 
     host.setHooks({
       x: importItems,

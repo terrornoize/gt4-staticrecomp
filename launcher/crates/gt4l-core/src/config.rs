@@ -22,6 +22,10 @@ pub struct ConfigFile {
     /// An existing texture folder the player chose (`[install] textures_path`, TASK-157), read in place instead of
     /// `<data>\Textures`. Launcher-only; the launcher never writes into it. `None`: the default folder.
     pub textures_path: Option<PathBuf>,
+    /// A save library folder the player chose (`[install] library_path`), for example a OneDrive folder shared by several
+    /// PCs. `Saves` and `Replays` of every game live there (`games\<id>\...`); settings, controls and card backups stay
+    /// on this PC. `None`: the library is in the user data folder.
+    pub library_path: Option<PathBuf>,
     pub dev_game_dir: Option<PathBuf>,
     /// "Skip this version" choices of the update popup: no offer again for exactly this version.
     pub skipped_launcher: Option<ReleaseVersion>,
@@ -37,6 +41,7 @@ impl Default for ConfigFile {
             settings: Settings::default(),
             disc_path: None,
             textures_path: None,
+            library_path: None,
             dev_game_dir: None,
             skipped_launcher: None,
             skipped_renderer: None,
@@ -137,6 +142,13 @@ pub fn parse(text: &str) -> Result<(ConfigFile, Vec<String>), ConfigError> {
         .and_then(|value| value.as_str())
         .filter(|text| !text.is_empty())
         .map(PathBuf::from);
+    config.library_path = table
+        .get("install")
+        .and_then(|value| value.as_table())
+        .and_then(|section| section.get("library_path"))
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+        .map(PathBuf::from);
     config.dev_game_dir = table
         .get("dev")
         .and_then(|value| value.as_table())
@@ -206,6 +218,9 @@ pub fn render(config: &ConfigFile) -> String {
     }
     if let Some(path) = &config.textures_path {
         text.push_str(&format!("textures_path = {}\n", quote(&path.to_string_lossy())));
+    }
+    if let Some(path) = &config.library_path {
+        text.push_str(&format!("library_path = {}\n", quote(&path.to_string_lossy())));
     }
     if let Some(path) = &config.dev_game_dir {
         text.push_str("\n[dev]\n");

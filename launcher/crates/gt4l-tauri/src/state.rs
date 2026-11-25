@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use gt4l_core::settings::Settings;
 use gt4l_core::config::{self, ConfigFile};
 use gt4l_core::language::{self, Language};
+use gt4l_core::messages;
 use gt4l_core::display as display_rules;
 use gt4l_core::gs_release;
 use gt4l_core::gs_table;
@@ -80,6 +81,13 @@ pub struct AppState {
     pub saves_status: String,
     /// Result of the last import or delete on the Replays page.
     pub replays_status: String,
+    /// The chosen shared library folder (`[install] library_path`) cannot be used now (a OneDrive folder not there yet,
+    /// say). The libraries shown are this PC's, and Play refuses with this text until the folder is back or the player goes
+    /// back to this PC's folder: playing on this PC's older saves would split the progress between two places.
+    pub library_problem: Option<String>,
+    /// The other PC's marker (`gt4l_core::shared_library::InUse`, as text) the player chose to start over: the second Play
+    /// press after the warning.
+    pub in_use_confirmed: Option<String>,
     /// True when the controls file was written by a newer launcher: it is kept as it is (never overwritten).
     pub controls_locked: bool,
     pub ra_revision: u64,
@@ -205,7 +213,87 @@ pub fn log_error(dirs: &DataDirs, message: &str) {
     crate::session_log::write(dirs, gt4l_core::logs::Level::Error, message);
 }
 
+/// The save libraries of every game and what the Saves page should say about them.
+pub struct OpenedLibraries {
+    pub libraries: BTreeMap<&'static str, GameLibrary>,
+    /// A sentence about this PC's library (the one-time move of an old library, the data-folder fallback).
+    pub notice: Option<String>,
+    /// The chosen shared folder cannot be used now (see [`AppState::library_problem`]).
+    pub problem: Option<String>,
+}
+
+/// Opens one save library per game. With a shared library folder (`[install] library_path`) the libraries are opened
+/// there; when that folder cannot be used (missing, refused, unreadable), this PC's libraries are opened and `problem`
+/// says why, so Play can refuse. `pre_1_0_root` is the old library of launchers before 1.0.0 (Gran Turismo 4 only; it is
+/// taken over into this PC's library, never into a shared one).
+pub fn open_libraries(
+    dirs: &DataDirs,
+    user: &UserDirs,
+    shared: Option<&Path>,
+    pre_1_0_root: Option<&Path>,
+    language: Language,
+) -> Result<OpenedLibraries, String> {
+    let mut problem = None;
+    if let Some(shared) = shared {
+        match gt4l_core::shared_library::check_library_path(shared, dirs.root(), user.root()) {
+            Ok(folder) => {
+                let shared_user = user.with_shared_library(&folder);
+                match open_each(dirs, &shared_user, None) {
+                    Ok((libraries, notice)) => {
+                        log(dirs, &format!("save library: shared folder {}", folder.display()));
+                        return Ok(OpenedLibraries { libraries, notice, problem: None });
+                    }
+                    Err(error) => {
+                        log_error(dirs, &format!("save library: shared folder {} cannot be opened ({error}); this PC's library is shown", folder.display()));
+                        problem = Some(messages::render(
+                            "library.unavailable",
+                            language,
+                            &[("path", &shared.display().to_string()), ("reason", &error)],
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                let reason = messages::text(error.message_id(), language);
+                log_error(dirs, &format!("save library: shared folder {} cannot be used ({}); this PC's library is shown", shared.display(), error.message_id()));
+                problem = Some(messages::render("library.unavailable", language, &[("path", &shared.display().to_string()), ("reason", reason)]));
+            }
+        }
+    }
+    let (libraries, notice) = open_each(dirs, user, pre_1_0_root)?;
+    Ok(OpenedLibraries { libraries, notice, problem })
+}
+
+/// [`saves::open`] for every game, with `user` as given (this PC's folders, or the shared library).
+fn open_each(dirs: &DataDirs, user: &UserDirs, pre_1_0_root: Option<&Path>) -> Result<(BTreeMap<&'static str, GameLibrary>, Option<String>), String> {
+    let mut libraries = BTreeMap::new();
+    let mut library_notice = None;
+    for game in games::GAMES {
+        // Only Gran Turismo 4 has a library from before 1.0.0 to take over.
+        let old_root = if game.id == GT4.id { pre_1_0_root } else { None };
+        let opened = saves::open(&dirs.for_game(game), &user.for_game(game), game, old_root)?;
+        for line in &opened.log {
+            log(dirs, &format!("{}: {line}", game.id));
+        }
+        if game.id == GT4.id {
+            library_notice = opened.notice.clone();
+        }
+        libraries.insert(game.id, GameLibrary { library: opened.library, user: opened.user });
+    }
+    Ok((libraries, library_notice))
+}
+
 impl AppState {
+    /// Opens the libraries again after the shared library folder changed (`config.library_path`). The page is told
+    /// through `saves_status`.
+    pub fn reopen_libraries(&mut self) -> Result<(), String> {
+        let opened = open_libraries(&self.dirs, &self.user_dirs, self.config.library_path.as_deref(), None, language_of(self))?;
+        self.libraries = opened.libraries;
+        self.library_problem = opened.problem;
+        self.in_use_confirmed = None;
+        Ok(())
+    }
+
     /// Loads the settings and controls from the user data folder and opens the save library there.
     /// `pre_1_0_root` is the 1.2.0 `%LOCALAPPDATA%\GT4Recomp`, which may still hold a library of launchers before 1.0.0.
     pub fn load(dirs: DataDirs, user: UserDirs, pre_1_0_root: Option<PathBuf>) -> Result<AppState, String> {
@@ -250,20 +338,10 @@ impl AppState {
             }
         };
         let (wheel_config, wheel_load) = load_wheel(&dirs, &user.wheel_file());
-        let mut libraries = BTreeMap::new();
-        let mut library_notice = None;
-        for game in games::GAMES {
-            // Only Gran Turismo 4 has a library from before 1.0.0 to take over.
-            let old_root = if game.id == GT4.id { pre_1_0_root.as_deref() } else { None };
-            let opened = saves::open(&dirs.for_game(game), &user.for_game(game), game, old_root)?;
-            for line in &opened.log {
-                log(&dirs, &format!("{}: {line}", game.id));
-            }
-            if game.id == GT4.id {
-                library_notice = opened.notice.clone();
-            }
-            libraries.insert(game.id, GameLibrary { library: opened.library, user: opened.user });
-        }
+        let opened = open_libraries(&dirs, &user, config.library_path.as_deref(), pre_1_0_root.as_deref(), language_of_settings(&config.settings))?;
+        let libraries = opened.libraries;
+        let library_notice = opened.notice;
+        let library_problem = opened.problem;
         let spec2_pins = Spec2Pins::embedded()?;
         let mut state = AppState {
             dirs,
@@ -287,7 +365,9 @@ impl AppState {
             capturing: None,
             home_message: String::new(),
             controls_status: String::new(),
-            saves_status: library_notice.unwrap_or_default(),
+            saves_status: library_problem.clone().or(library_notice).unwrap_or_default(),
+            library_problem,
+            in_use_confirmed: None,
             replays_status: String::new(),
             controls_locked,
             ra_revision: 0,
@@ -495,4 +575,48 @@ fn load_wheel(dirs: &DataDirs, path: &Path) -> (WheelConfig, LoadState) {
 
 fn unix_seconds() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod shared_library_tests {
+    use super::*;
+    use gt4l_core::games::SPEC2;
+    use gt4l_core::paths::UserRootSource;
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("gt4l-state-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_shared_folder_that_is_not_there_shows_this_pcs_library_and_names_the_problem() {
+        let base = scratch("shared-missing");
+        let dirs = DataDirs::new(base.join("data"));
+        let user = UserDirs::new(base.join("user"), UserRootSource::Override);
+        let missing = base.join("OneDrive").join("SaveGames");
+        let opened = open_libraries(&dirs, &user, Some(&missing), None, Language::fallback()).unwrap();
+        let problem = opened.problem.expect("Play must refuse");
+        assert!(problem.contains(&missing.display().to_string()), "{problem}");
+        assert_eq!(opened.libraries[SPEC2.id].user.shared_library(), None);
+        assert_eq!(opened.libraries[SPEC2.id].user.saves(), user.for_game(&SPEC2).saves());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_shared_folder_holds_the_saves_of_every_game() {
+        let base = scratch("shared-there");
+        let dirs = DataDirs::new(base.join("data"));
+        let user = UserDirs::new(base.join("user"), UserRootSource::Override);
+        let cloud = base.join("OneDrive").join("SaveGames").join("gt4-staticrecomp");
+        fs::create_dir_all(&cloud).unwrap();
+        let opened = open_libraries(&dirs, &user, Some(&cloud), None, Language::fallback()).unwrap();
+        assert_eq!(opened.problem, None);
+        for game in games::GAMES {
+            assert_eq!(opened.libraries[game.id].user.saves(), cloud.join("games").join(game.id).join("Saves"));
+            assert_eq!(opened.libraries[game.id].user.card_backups(), user.for_game(game).card_backups());
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
 }

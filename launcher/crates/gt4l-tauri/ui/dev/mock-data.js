@@ -54,6 +54,19 @@
       valid: !/Missing/.test(texturesChoice)
     };
   }
+  // The save library folder choice of the mock (empty: this PC's folder). ?library=missing shows the problem text.
+  var libraryChoice = "";
+  var libraryMessage = "";
+  function libraryState() {
+    var missing = libraryChoice !== "" && query.get("library") === "missing";
+    return {
+      path: libraryChoice,
+      local: "C:\\Users\\Player\\AppData\\Roaming\\GT4Recomp",
+      shared: libraryChoice !== "",
+      problem: missing ? "The saves folder " + libraryChoice + " cannot be used (That folder does not exist.)." : "",
+      message: libraryMessage
+    };
+  }
   var selectedGame = query.get("selected") ||
     (GAME_TABLE.filter(function (game) { return game.installed; })[0] || GAME_TABLE[0]).id;
   var setupGame = null; // the game of the setup that runs (set by setup_choose_disc)
@@ -996,6 +1009,17 @@
       case "reset_textures_folder":
         texturesChoice = "";
         return texturesState();
+      case "library_state":
+        return libraryState();
+      case "choose_library_folder":
+        // The mock "picks" a OneDrive folder, as the folder picker would.
+        libraryChoice = "C:\\Users\\Player\\OneDrive\\SaveGames\\gt4-staticrecomp";
+        libraryMessage = "Saves are now kept in " + libraryChoice + ". The saves of this PC were copied there: Gran Turismo 4 Spec II.";
+        return libraryState();
+      case "reset_library_folder":
+        libraryMessage = libraryChoice ? "Saves are kept on this PC again. " + libraryChoice + " is left as it is; to play with the saves in it, choose it again." : "";
+        libraryChoice = "";
+        return libraryState();
       case "export_logs":
         // The mock does not write a bundle: the player "cancelled" the folder choice.
         return null;
