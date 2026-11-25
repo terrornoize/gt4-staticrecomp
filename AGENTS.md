@@ -36,10 +36,9 @@ claim zero emulation or full PS2 fidelity.
   at 100% game speed, smooth frametime, no interpreter on the normal path.
 - **Phase 2 (current):** CoreGS 2.0 (TASK-027); when it is ready, release 2.0.0 with
   CoreGS 2.0 as the default renderer and GSdx as the fallback.
-- **Out of scope here:** a decompilation-based source port, changes to the game's
-  physics timing and remaster features will be a separate project, possibly a fork.
-  This repository's goal is the original game running natively, optimized and as
-  faithful as possible.
+- **A decompilation-based source port stays out of scope.** The original game running
+  natively, optimized and faithful, remains the default experience; opt-in gameplay
+  mods ship in the same bundle (see the game-patch and mod rules below).
 - **Game patches: improvements that leave gameplay and progression alone are in scope**
   (owner, 2026-11-04). The original game stays, with built-in options on top.
   - **In scope.** Examples:
@@ -47,8 +46,11 @@ claim zero emulation or full PS2 fidelity.
     - real-time FoV adjustment (TASK-160);
     - ultrawide and other screen ratios (TASK-079, TASK-080);
     - control comfort such as the full trigger range (TASK-161).
-  - **Out of scope:** anything that changes how the game plays or what it rewards. That covers physics, AI, race timing,
-    car data, progression and saves.
+  - **Gameplay mods are in scope, opt-in** (owner, 2026-11-11; `docs/decisions/0073-mod-support-in-bundle.md`). Mods
+    may add or change gameplay systems (for example an H-shifter with direct gear application, reverse as a gate
+    position, a clutch pedal). They are off by default, clearly labelled, documented with their replay/save effects,
+    and never silently enabled; with every mod off the game is identical to the reference. Anything that changes how the
+    game plays or what it rewards is a mod, not a patch.
   - **How a patch is made.** Community PCSX2 patches and the owner's own ideas are rebuilt as our own hooks in the translated
     code (decisions/game-patches-scope in ai-memory). Third-party patch code is a reference only, never copied.
   - **What each patch needs.** A switch, CTest fixtures and identity evidence:
@@ -69,9 +71,9 @@ claim zero emulation or full PS2 fidelity.
     checks (night, rain, rally, replays, photo, split screen) and a list of effects to
     restore. CoreGS 2.0 keeps its 1x identity gates where practical and relaxes one only
     explicitly, for a named optimisation.
-  - **Game logic never changes:** physics, timing, AI, saves, and anything the EE or IOP
-    reads back that affects gameplay stay exact (decisions/coregs3-modern-pipeline in
-    ai-memory).
+  - **Base game logic never changes; opt-in mods may** (decision 0073): in the faithful modes (GSdx, CoreGS 2.0,
+    CoreGS 3.0 without mods) physics, timing, AI, saves and gameplay read-backs stay exact. Opt-in mods may change
+    gameplay; they are explicit and off by default.
 - **Aspect ratios are in scope** (owner, 2026-10-21; TASK-079, TASK-080): 16:9 forced
   at boot, and native support for other screen ratios (16:10, phones, 21:9, 32:9):
   the renderer stretches to the screen, the game's own projection values (Width and
@@ -135,6 +137,11 @@ github.com/Kaezzey/gt4-staticrecomp is read-only.
 - One variable per candidate build; keep A/B switches (`GT4_PACING=audio`,
   `GT4_GS_SYNC=1`, `--vu1-interpret-only`, `--vu1-verify N`). Attack whatever the
   F8 report shows as the largest cost.
+- **Clean build caches after every task** (owner, 2026-11-11): after a task is merged or a
+  worktree is finished, delete its compiled build directories (CMake caches, objects,
+  binaries) in every worktree and never let them accumulate. Keep the pinned artifacts the
+  gates need (the v5 EE library, the reference executable), the docs and the `evidence-*`
+  files; check free space before a build round.
 - Work is organized in `TASKS.md` (TASK-001, TASK-002, ...). Keep it current:
   states, branch, acceptance, and new tasks appended in order.
 - **Task lifecycle:** each task gets its own branch from `main`
